@@ -1,0 +1,62 @@
+# bolt.diy for Deplexo. One container, public port 8080.
+#   :8080  deplexo-gateway.mjs (login + watchdog, public)  ->  127.0.0.1:5173 vite preview (bolt.diy, private)
+# Deplexo runs one container per app with a read-only root filesystem; only /tmp is writable.
+# So: everything is installed at build time and runtime write paths are symlinked into /tmp.
+
+# ---- build ----
+FROM node:22-bookworm-slim AS build
+WORKDIR /app
+ENV HUSKY=0 CI=true
+RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY package.json pnpm-lock.yaml* ./
+RUN pnpm fetch
+COPY . .
+RUN pnpm install --offline --frozen-lockfile
+RUN NODE_OPTIONS=--max-old-space-size=4096 pnpm run build
+
+# ---- runtime ----
+# Full node_modules are kept on purpose: the start command is `vite preview`, and upstream's
+# `pnpm prune --prod` removes vite (the "vite: not found" crash).
+FROM build AS runtime
+WORKDIR /app
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && update-ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Paths the toolchain may write to at runtime become symlinks into /tmp.
+# Whatever the build produced there is parked in /opt/seed and copied back by the gateway at startup.
+RUN set -eu; mkdir -p /opt/seed /app/node_modules; \
+    for p in .wrangler/state .wrangler/tmp .react-router/types; do \
+      mkdir -p "/app/$(dirname "$p")" "/opt/seed/$(dirname "$p")"; \
+      if [ -e "/app/$p" ]; then mv "/app/$p" "/opt/seed/$p"; fi; \
+      ln -s "/tmp/state/$p" "/app/$p"; \
+    done; \
+    ln -sfn /tmp/vite-cache /app/node_modules/.vite; \
+    ln -sfn /tmp/vite-temp  /app/node_modules/.vite-temp; \
+    ln -sfn /tmp/node-cache /app/node_modules/.cache
+
+ENV NODE_ENV=production \
+    PORT=8080 \
+    INTERNAL_PORT=5173 \
+    RUNNING_IN_DOCKER=true \
+    VITE_LOG_LEVEL=info \
+    DEFAULT_NUM_CTX=32768 \
+    WRANGLER_SEND_METRICS=false \
+    HOME=/tmp/home \
+    XDG_CONFIG_HOME=/tmp/xdg-config \
+    XDG_DATA_HOME=/tmp/xdg-data \
+    XDG_CACHE_HOME=/tmp/xdg-cache \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    SSL_CERT_DIR=/etc/ssl/certs \
+    BOLT_NODE_HEAP_MB=384
+
+# Unprivileged user that ships with the base image.
+USER node
+EXPOSE 8080
+CMD ["node", "/app/deplexo-gateway.mjs"]
